@@ -1,0 +1,14 @@
+python create_domains.py \
+  --source hf \
+  --hf-source mlfoundations/dclm-baseline-1.0-parquet \
+  --hf-source bigcode/the-stack \
+  --source-weight 1 \
+  --source-weight 1 \
+  --sample-tokens 100_000_000 \
+  --max-experts 8 \
+  --vocab-size 16_384 \
+  --assignment-rounds 4 \
+  --structure-passes 2 \
+  --output-dir runs/dclm-stack-50m50m \
+  --save-sample \
+  --overwrite

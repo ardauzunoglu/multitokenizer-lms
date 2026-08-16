@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.orig
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Generated experiment outputs and model artifacts
+runs/
+runs_v1/
+checkpoints/
+wandb/
+*.log
+
+# Local environments and editor state
+.venv/
+venv/
+.env
+.env.*
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
