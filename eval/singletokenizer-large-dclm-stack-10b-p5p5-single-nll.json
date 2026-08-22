@@ -1,0 +1,24 @@
+{
+  "block_size": {
+    "single": 4096
+  },
+  "dataset": "ardauzunoglu/dclm-stack-10b-p5p5",
+  "device": "cuda",
+  "documents_evaluated": 4164,
+  "documents_skipped_empty_or_missing_text": 0,
+  "single_tokenizer_lm": {
+    "bits_per_byte": 1.4476136028988245,
+    "documents": 4164,
+    "model": "/weka/scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/hf/dclm_stack_20m_single_large_10b_seq4096_seed1000/step-9000/single_tokenizer",
+    "nats_per_byte": 1.0034092873895444,
+    "nats_per_token": 3.283995422719843,
+    "nll_sum_nats": 31926895.127833366,
+    "perplexity": 26.682166548582664,
+    "predicted_tokens": 9721967,
+    "source_bytes": 31818417
+  },
+  "source_bytes": 31818417,
+  "split": "eval",
+  "streaming": true,
+  "text_column": "text"
+}

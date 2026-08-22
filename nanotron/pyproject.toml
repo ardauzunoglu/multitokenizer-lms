@@ -16,7 +16,7 @@ classifiers = [
 dependencies = [
     "torch>=1.13.1",
     "pyyaml",
-    "numpy<2",
+    "numpy>=2,<3",
     "packaging",
     "safetensors",
     "dacite",

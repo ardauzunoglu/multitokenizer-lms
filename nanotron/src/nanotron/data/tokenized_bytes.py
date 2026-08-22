@@ -1,3 +1,4 @@
+import inspect
 import os
 import re
 import time
@@ -419,21 +420,46 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
                 except Exception as e:
                     raise RuntimeError(f"Failed to read cache file on rank {dist.get_rank()}: {e}")
 
-        super().__init__(
-            folder_path=folder_path,
-            seq_len=seq_len,
-            filename_pattern=filename_pattern,
-            recursive=recursive,
-            token_size=token_size,
-            max_tokens=max_tokens,
-            shuffle=shuffle,
-            seed=seed,
-            return_positions=return_positions,
-            eos_token_id=eos_token_id,
-            read_path=folder_read_path,
-            matched_files=matched_files,
-            file_sizes=file_sizes,
-        )
+        datatrove_parameters = inspect.signature(DatatroveFolderDataset.__init__).parameters
+        if "data_folder" in datatrove_parameters:
+            # Datatrove >= 0.5 renamed folder_path to data_folder and removed
+            # the precomputed file-list API.  Its DataFolder implementation
+            # handles both local paths and fsspec-backed URLs itself.
+            if max_tokens is not None:
+                log_rank(
+                    "datatrove's current FolderDataset API does not support dataset_max_tokens; "
+                    "using the complete dataset.",
+                    logger=logger,
+                    level=logging.WARNING,
+                    rank=0,
+                )
+            super().__init__(
+                data_folder=folder_read_path or folder_path,
+                seq_len=seq_len,
+                filename_pattern=filename_pattern or ".ds",
+                recursive=recursive,
+                token_size=token_size,
+                shuffle=shuffle,
+                seed=seed,
+                return_positions=return_positions,
+                positions_from_eos_token_id=eos_token_id,
+            )
+        else:
+            super().__init__(
+                folder_path=folder_path,
+                seq_len=seq_len,
+                filename_pattern=filename_pattern,
+                recursive=recursive,
+                token_size=token_size,
+                max_tokens=max_tokens,
+                shuffle=shuffle,
+                seed=seed,
+                return_positions=return_positions,
+                eos_token_id=eos_token_id,
+                read_path=folder_read_path,
+                matched_files=matched_files,
+                file_sizes=file_sizes,
+            )
 
         self.subset_log = TBFolderDatasetLog(
             dataset_type=self.__class__.__name__,

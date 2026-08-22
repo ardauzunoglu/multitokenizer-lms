@@ -1,0 +1,24 @@
+multi_tokenizer:
+  batching: step_homogeneous
+  tie_word_embeddings: true
+  mask_padded_vocab_logits: true
+  schedule:
+    strategy: weighted_deficit
+    # Token counts produced by preprocess_multitokenizers.sh.  These preserve
+    # the routed corpus mixture when one optimizer step uses one tokenizer.
+    weights: [5464988301, 1237438227, 3710788176]
+    weight_unit: tokens
+    seed: 42
+  tokenizers:
+    - id: 0
+      name: expert_00
+      tokenizer_name_or_path: ../train_tokenizers/runs_v1/dclm-stack-50m50m/hf_tokenizers/expert_00
+      vocab_size: 16384
+    - id: 1
+      name: expert_01
+      tokenizer_name_or_path: ../train_tokenizers/runs_v1/dclm-stack-50m50m/hf_tokenizers/expert_01
+      vocab_size: 16384
+    - id: 2
+      name: expert_02
+      tokenizer_name_or_path: ../train_tokenizers/runs_v1/dclm-stack-50m50m/hf_tokenizers/expert_02
+      vocab_size: 16384

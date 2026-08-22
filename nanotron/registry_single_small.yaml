@@ -1,0 +1,14 @@
+multi_tokenizer:
+  tokenizers:
+    - id: 0
+      name: source_00
+      tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/tokenizers/single_small
+      vocab_size: 16384
+    - id: 1
+      name: source_01
+      tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/tokenizers/single_small
+      vocab_size: 16384
+    - id: 2
+      name: source_02
+      tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/tokenizers/single_small
+      vocab_size: 16384

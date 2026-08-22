@@ -1,0 +1,19 @@
+python train_tokenizers.py \
+  --source hf \
+  --hf-source mlfoundations/dclm-baseline-1.0-parquet \
+  --hf-source bigcode/the-stack \
+  --source-weight 1 \
+  --source-weight 1 \
+  --sample-tokens 100_000_000 \
+  --max-experts 8 \
+  --structure-passes 2 \
+  --output-dir runs_v2/dclm-stack-50m50m \
+  --save-sample \
+  --overwrite \
+  --vocab-size 16384 \
+  --residual-union-vocab-size 49152 \
+  --assignment-rounds 12 \
+  --soft-assignment-temperature 0.02 \
+  --soft-temperature-decay 0.9 \
+  --soft-top-k 2 \
+  --soft-training-oversample 2

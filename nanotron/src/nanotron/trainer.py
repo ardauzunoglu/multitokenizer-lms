@@ -1185,8 +1185,10 @@ class DistributedTrainer:
             # TODO @thomasw21: DDP doesn't support broadcasting complex buffers (and we don't really need that broadcasting anyway)
             ddp_kwargs = {"process_group": parallel_context.dp_cp_pg, "broadcast_buffers": False,
                           "bucket_cap_mb": config.model.ddp_bucket_cap_mb}
-            if self.vocabulary_config is not None:
-                ddp_kwargs["find_unused_parameters"] = True
+            # Multi-tokenizer endpoint banks keep inactive endpoints in the
+            # autograd graph with zero gradients.  This avoids DDP's
+            # find_unused_parameters reducer path, which cannot be combined with
+            # Nanotron's multiple backwards per training step.
             model = DistributedDataParallel(model, **ddp_kwargs)
 
         # Sanity check the model, all parameters must be NanotronParameter (either tied or sharded)

@@ -4,15 +4,26 @@ from typing import Literal, Optional, Tuple
 import torch
 from packaging import version
 
-from nanotron.nn.ring_attention import ring_flash_attn_varlen_func
-from nanotron.nn.llama3_ring_attention import llama3_flash_attn_varlen_qkvpacked_func
-
-# Replace direct import with a function for lazy loading
+# FlashAttention-backed implementations must stay lazy: importing this module is
+# also required for SDPA-only runs, which should not require the flash_attn
+# extension to be installed or ABI-compatible.
 def get_ring_flash_attn_cuda():
     """Lazily import ring_flash_attn_cuda to avoid early Triton dependency."""
     from nanotron.nn.ring_attention_lucidrain import ring_flash_attn_cuda
 
     return ring_flash_attn_cuda
+
+
+def ring_attention_forward(*args, **kwargs):
+    from nanotron.nn.ring_attention import ring_flash_attn_varlen_func
+
+    return ring_flash_attn_varlen_func(*args, **kwargs)
+
+
+def llama3_ring_attention_forward(*args, **kwargs):
+    from nanotron.nn.llama3_ring_attention import llama3_flash_attn_varlen_qkvpacked_func
+
+    return llama3_flash_attn_varlen_qkvpacked_func(*args, **kwargs)
 
 
 @lru_cache()
@@ -216,8 +227,8 @@ ALL_ATTENTION_FUNCTIONS = {
     "flex_attention": flex_attention_forward,
     "sdpa": sdpa_attention_forward,
     "ring_flash_triton": lambda *args, **kwargs: get_ring_flash_attn_cuda()(*args, **kwargs),
-    "ring": ring_flash_attn_varlen_func,
-    "llama3_ring_attention": llama3_flash_attn_varlen_qkvpacked_func,
+    "ring": ring_attention_forward,
+    "llama3_ring_attention": llama3_ring_attention_forward,
 }
 
 AttentionImplementation = Literal[tuple(ALL_ATTENTION_FUNCTIONS.keys())]

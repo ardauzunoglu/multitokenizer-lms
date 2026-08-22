@@ -6,8 +6,9 @@ domain discovery for a multi-tokenizer language model:
 
 1. Stream a token-budgeted sample from one or more Hugging Face datasets (or
    a local JSONL file).
-2. Initialize latent domains from tokenizer-independent byte/character n-grams.
-3. Alternate independent BPE fitting and document reassignment.
+2. Initialize latent domains from compression-residual features distilled from
+   matched small and union tokenizers.
+3. Alternate weighted, overlapping BPE fitting and hard document reassignment.
 4. Prune tiny experts and greedily accept MDL-improving splits/merges.
 5. Optionally train a small shared causal Transformer with disjoint, tied
    embedding/LM-head tables.
@@ -81,6 +82,9 @@ class DiscoveryResult:
     costs: np.ndarray
     objective: float
     expert_penalty: float
+    responsibilities: np.ndarray | None = None
+    converged: bool = False
+    em_rounds: int = 0
 
 
 class WhitespaceBudgetTokenizer:
@@ -398,6 +402,130 @@ def document_features(documents: Sequence[Document], dimensions: int, ngram_max:
     return vectorizer.transform(document.text for document in documents)
 
 
+def compression_residual_features(
+    documents: Sequence[Document],
+    small_tokenizer: Any,
+    union_tokenizer: Any,
+    batch_size: int,
+    max_features_per_document: int,
+):
+    """Represent documents by the union-token merges that save small-tokenizer tokens.
+
+    The feature for union token ``t`` is its document frequency multiplied by
+    the number of small-tokenizer pieces needed to encode ``t`` in isolation.
+    Rows are L2 normalized so clustering follows *which* merges are useful,
+    rather than merely document length. Only the strongest features in each
+    document are retained to keep the sparse matrix bounded on large samples.
+    """
+
+    sparse = require_module("scipy.sparse", "scipy")
+    preprocessing = require_module("sklearn.preprocessing", "scikit-learn")
+    union_vocab_size = int(union_tokenizer.get_vocab_size())
+
+    merge_savings = np.full(union_vocab_size, 0.25, dtype=np.float32)
+    for token_id in range(union_vocab_size):
+        try:
+            piece = union_tokenizer.decode([token_id], skip_special_tokens=False)
+            if piece:
+                small_pieces = len(small_tokenizer.encode(piece).ids)
+                merge_savings[token_id] = max(float(small_pieces - 1), 0.25)
+        except Exception:
+            # Individual byte-level tokens are not always independently
+            # decodable. They still carry a small identity feature.
+            continue
+
+    rows: list[int] = []
+    columns: list[int] = []
+    values: list[float] = []
+    small_costs = np.zeros(len(documents), dtype=np.int64)
+    union_costs = np.zeros(len(documents), dtype=np.int64)
+    texts = [document.text for document in documents]
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        small_encoded = small_tokenizer.encode_batch(batch)
+        union_encoded = union_tokenizer.encode_batch(batch)
+        for offset, (small_item, union_item) in enumerate(
+            zip(small_encoded, union_encoded)
+        ):
+            row = start + offset
+            small_costs[row] = len(small_item.ids)
+            union_costs[row] = len(union_item.ids)
+            counts = Counter(int(token_id) for token_id in union_item.ids)
+            weighted = [
+                (count * float(merge_savings[token_id]), token_id)
+                for token_id, count in counts.items()
+            ]
+            if max_features_per_document > 0:
+                weighted.sort(reverse=True)
+                weighted = weighted[:max_features_per_document]
+            for value, token_id in weighted:
+                rows.append(row)
+                columns.append(token_id)
+                values.append(value)
+
+    matrix = sparse.csr_matrix(
+        (np.asarray(values, dtype=np.float32), (rows, columns)),
+        shape=(len(documents), union_vocab_size),
+        dtype=np.float32,
+    )
+    matrix = preprocessing.normalize(matrix, norm="l2", copy=False)
+    residual_gaps = np.maximum(small_costs - union_costs, 0)
+    LOGGER.info(
+        "Residual features: %s nonzeros, union saves %s tokens over small teacher",
+        f"{matrix.nnz:,}",
+        f"{int(residual_gaps.sum()):,}",
+    )
+    return matrix, residual_gaps
+
+
+def build_discovery_features(
+    documents: Sequence[Document],
+    initial_k: int,
+    output_dir: Path,
+    args: argparse.Namespace,
+):
+    initialization = getattr(args, "initialization", "residual")
+    if initialization == "char":
+        LOGGER.info("Building tokenizer-independent character features")
+        return (
+            document_features(
+                documents, args.feature_dimensions, args.feature_ngram_max
+            ),
+            None,
+        )
+
+    teacher_dir = output_dir / "residual_teachers"
+    texts = [document.text for document in documents]
+    requested_union_vocab = getattr(args, "residual_union_vocab_size", None)
+    union_vocab_size = requested_union_vocab or initial_k * args.vocab_size
+    union_vocab_size = max(args.vocab_size, int(union_vocab_size))
+    LOGGER.info(
+        "Training residual teachers with vocabularies %s and %s",
+        f"{args.vocab_size:,}",
+        f"{union_vocab_size:,}",
+    )
+    small_tokenizer = train_bpe(
+        texts,
+        teacher_dir / "single_small",
+        args.vocab_size,
+        args.min_frequency,
+    )
+    union_tokenizer = train_bpe(
+        texts,
+        teacher_dir / "single_union",
+        union_vocab_size,
+        args.min_frequency,
+    )
+    return compression_residual_features(
+        documents,
+        small_tokenizer,
+        union_tokenizer,
+        args.score_batch_size,
+        getattr(args, "residual_features_per_document", 256),
+    )
+
+
 def initialize_labels(features: Any, k: int, seed: int) -> np.ndarray:
     cluster = require_module("sklearn.cluster", "scikit-learn")
     k = max(1, min(k, features.shape[0]))
@@ -416,6 +544,56 @@ def initialize_labels(features: Any, k: int, seed: int) -> np.ndarray:
 def relabel_contiguous(labels: np.ndarray) -> np.ndarray:
     mapping = {old: new for new, old in enumerate(sorted(np.unique(labels).tolist()))}
     return np.asarray([mapping[int(label)] for label in labels], dtype=np.int64)
+
+
+def one_hot_responsibilities(
+    labels: np.ndarray, expert_count: int | None = None
+) -> np.ndarray:
+    labels = relabel_contiguous(labels)
+    k = expert_count or int(labels.max()) + 1
+    responsibilities = np.zeros((len(labels), k), dtype=np.float64)
+    responsibilities[np.arange(len(labels)), labels] = 1.0
+    return responsibilities
+
+
+def weighted_document_counts(
+    weights: np.ndarray, oversample: float, seed: int
+) -> np.ndarray:
+    """Low-variance integer approximation to fractional document weights."""
+
+    expected = np.asarray(weights, dtype=np.float64) * oversample
+    counts = np.floor(expected).astype(np.int64)
+    residual = expected - counts
+    remaining = max(0, int(round(float(expected.sum()))) - int(counts.sum()))
+    positive = np.flatnonzero(residual > 0)
+    if remaining and positive.size:
+        rng = np.random.default_rng(seed)
+        remaining = min(remaining, int(positive.size))
+        probabilities = residual[positive]
+        probabilities /= probabilities.sum()
+        selected = rng.choice(
+            positive, size=remaining, replace=False, p=probabilities
+        )
+        counts[selected] += 1
+    return counts
+
+
+def weighted_training_texts(
+    documents: Sequence[Document],
+    weights: np.ndarray,
+    oversample: float,
+    seed: int,
+) -> list[str]:
+    counts = weighted_document_counts(weights, oversample, seed)
+    texts = [
+        document.text
+        for document, repetitions in zip(documents, counts)
+        for _ in range(int(repetitions))
+    ]
+    if texts:
+        return texts
+    # A positive-mass expert must always have at least one training document.
+    return [documents[int(np.argmax(weights))].text]
 
 
 def train_bpe(
@@ -454,22 +632,46 @@ def fit_experts(
     output_dir: Path,
     vocab_size: int,
     min_frequency: int,
+    responsibilities: np.ndarray | None = None,
+    soft_training_oversample: float = 1.0,
+    seed: int = 0,
 ) -> list[Expert]:
     labels = relabel_contiguous(labels)
+    if responsibilities is None:
+        responsibilities = one_hot_responsibilities(labels)
+    if responsibilities.shape[0] != len(documents):
+        raise ValueError("Responsibilities and documents have different lengths")
+    if responsibilities.shape[1] != int(labels.max()) + 1:
+        raise ValueError("Responsibilities do not match the active expert count")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale in output_dir.glob("expert_*"):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+
     experts: list[Expert] = []
-    for expert_id in range(int(labels.max()) + 1):
-        texts = [
-            document.text
-            for document, label in zip(documents, labels)
-            if label == expert_id
-        ]
-        if not texts:
-            continue
+    for expert_id in range(responsibilities.shape[1]):
+        weights = responsibilities[:, expert_id]
+        texts = weighted_training_texts(
+            documents,
+            weights,
+            soft_training_oversample,
+            seed + expert_id,
+        )
         directory = output_dir / f"expert_{expert_id:02d}"
         LOGGER.info(
-            "Training expert %d BPE on %s documents", expert_id, f"{len(texts):,}"
+            "Training expert %d BPE on %s weighted draws (mass %.1f; %s hard docs)",
+            expert_id,
+            f"{len(texts):,}",
+            float(weights.sum()),
+            f"{int(np.sum(labels == expert_id)):,}",
         )
-        tokenizer = train_bpe(texts, directory, vocab_size, min_frequency)
+        effective_min_frequency = max(
+            1, int(round(min_frequency * soft_training_oversample))
+        )
+        tokenizer = train_bpe(
+            texts, directory, vocab_size, effective_min_frequency
+        )
         experts.append(Expert(expert_id, tokenizer, directory))
     return experts
 
@@ -524,6 +726,81 @@ def prune_and_assign(
     return relabel_contiguous(labels)
 
 
+def soft_prune_and_assign(
+    documents: Sequence[Document],
+    costs: np.ndarray,
+    old_labels: np.ndarray,
+    prior_weight: float,
+    min_expert_fraction: float,
+    temperature: float,
+    top_k: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return hard routes plus soft top-k training responsibilities.
+
+    Costs are converted to relative regret before applying the temperature, so
+    a setting such as 0.02 has the same interpretation for short and long
+    documents: approximately a two-percent token-cost temperature.
+    """
+
+    k = costs.shape[1]
+    total_bytes = sum(document.raw_bytes for document in documents)
+    byte_usage = np.bincount(
+        old_labels,
+        weights=np.asarray([document.raw_bytes for document in documents]),
+        minlength=k,
+    )
+    priors = (byte_usage + 1.0) / (byte_usage.sum() + k)
+    active = np.where(byte_usage / max(total_bytes, 1) >= min_expert_fraction)[0]
+    if active.size == 0:
+        active = np.asarray([int(np.argmax(byte_usage))])
+
+    adjusted = costs[:, active].astype(np.float64)
+    if prior_weight > 0:
+        adjusted += prior_weight * (-np.log(priors[active]))[None, :]
+
+    labels = np.argmin(adjusted, axis=1).astype(np.int64)
+    responsibilities = np.zeros_like(adjusted, dtype=np.float64)
+    if temperature <= 0 or adjusted.shape[1] == 1:
+        responsibilities[np.arange(len(labels)), labels] = 1.0
+        return labels, responsibilities, active
+
+    minimum = adjusted.min(axis=1, keepdims=True)
+    relative_regret = (adjusted - minimum) / np.maximum(minimum, 1.0)
+    logits = -relative_regret / temperature
+    keep = min(max(1, top_k), adjusted.shape[1])
+    if keep < adjusted.shape[1]:
+        retained = np.argpartition(logits, -keep, axis=1)[:, -keep:]
+        mask = np.zeros_like(logits, dtype=bool)
+        mask[np.arange(len(labels))[:, None], retained] = True
+        logits = np.where(mask, logits, -np.inf)
+    logits -= np.max(logits, axis=1, keepdims=True)
+    responsibilities = np.exp(logits)
+    responsibilities /= responsibilities.sum(axis=1, keepdims=True)
+    return labels, responsibilities, active
+
+
+def materialize_experts(
+    experts: Sequence[Expert], output_dir: Path
+) -> list[Expert]:
+    """Copy a coherent EM snapshot to stable ``expert_XX`` directories."""
+
+    tokenizers = require_module("tokenizers", "tokenizers")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for stale in output_dir.glob("expert_*"):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+
+    materialized: list[Expert] = []
+    for expert_id, expert in enumerate(experts):
+        destination = output_dir / f"expert_{expert_id:02d}"
+        shutil.copytree(expert.directory, destination)
+        tokenizer = tokenizers.Tokenizer.from_file(
+            str(destination / "tokenizer.json")
+        )
+        materialized.append(Expert(expert_id, tokenizer, destination))
+    return materialized
+
+
 def run_reassignment_rounds(
     documents: Sequence[Document],
     initial_labels: np.ndarray,
@@ -531,10 +808,50 @@ def run_reassignment_rounds(
     args: argparse.Namespace,
     expert_penalty: float,
 ) -> DiscoveryResult:
-    labels = relabel_contiguous(initial_labels)
-    previous_objective = math.inf
+    return fit_experts_to_convergence(
+        documents,
+        initial_labels,
+        work_dir,
+        work_dir / "pre_split_merge",
+        args,
+        expert_penalty,
+    )
 
-    for round_index in range(args.assignment_rounds):
+
+def fit_experts_to_convergence(
+    documents: Sequence[Document],
+    initial_labels: np.ndarray,
+    work_dir: Path,
+    final_dir: Path,
+    args: argparse.Namespace,
+    expert_penalty: float,
+) -> DiscoveryResult:
+    """Run weighted tokenizer EM and save one internally coherent snapshot.
+
+    Unlike the previous refit path, this routine never trains once, changes the
+    assignments, and silently returns the stale tokenizers. Each round retains
+    its tokenizer files. A converged snapshot is preferred; otherwise the best
+    complete snapshot is materialized and explicitly reported as unconverged.
+    """
+
+    labels = relabel_contiguous(initial_labels)
+    responsibilities = one_hot_responsibilities(labels)
+    previous_objective = math.inf
+    max_rounds = max(1, int(args.assignment_rounds))
+    # Pruning changes the parameterization and needs a fresh fit; do not let a
+    # sequence of pruning events consume the entire requested EM budget.
+    round_limit = max_rounds + int(labels.max()) + 1
+    best: tuple[
+        float,
+        np.ndarray,
+        np.ndarray,
+        list[Expert],
+        np.ndarray,
+        int,
+    ] | None = None
+    converged_snapshot = None
+
+    for round_index in range(round_limit):
         round_dir = work_dir / f"round_{round_index:02d}"
         experts = fit_experts(
             documents,
@@ -542,65 +859,126 @@ def run_reassignment_rounds(
             round_dir,
             args.vocab_size,
             args.min_frequency,
+            responsibilities=responsibilities,
+            soft_training_oversample=getattr(
+                args, "soft_training_oversample", 2.0
+            ),
+            seed=args.seed + 10_000 * round_index,
         )
         costs = token_costs(documents, experts, args.score_batch_size)
-        new_labels = prune_and_assign(
+        temperature = getattr(args, "soft_assignment_temperature", 0.02) * (
+            getattr(args, "soft_temperature_decay", 0.7) ** round_index
+        )
+        new_labels, new_responsibilities, active = soft_prune_and_assign(
             documents,
             costs,
             labels,
             args.assignment_prior_weight,
             args.min_expert_fraction,
+            temperature,
+            getattr(args, "soft_top_k", 2),
         )
 
-        # The objective below uses the old experts but the proposed routing.
-        # If pruning changed indices, recompute using retained column choices by
-        # simply fitting the new experts on the next iteration.
-        changed = (
-            float(np.mean(new_labels != relabel_contiguous(labels)))
-            if len(new_labels)
-            else 0.0
-        )
-        labels = new_labels
-
-        # Fit objective on current expert family when dimensions still align.
-        if costs.shape[1] == len(np.unique(labels)):
-            objective = assignment_objective(costs, labels, expert_penalty)
-        else:
-            objective = float(
-                costs.min(axis=1).sum() + expert_penalty * len(np.unique(labels))
+        if len(active) != len(experts):
+            LOGGER.info(
+                "Round %d pruned %d expert(s); refitting the reduced family",
+                round_index,
+                len(experts) - len(active),
             )
+            labels = new_labels
+            responsibilities = new_responsibilities
+            continue
+
+        used = np.unique(new_labels)
+        if len(used) != len(experts):
+            LOGGER.info(
+                "Round %d produced %d empty hard-route expert(s); refitting",
+                round_index,
+                len(experts) - len(used),
+            )
+            new_responsibilities = new_responsibilities[:, used]
+            new_responsibilities /= new_responsibilities.sum(
+                axis=1, keepdims=True
+            )
+            labels = relabel_contiguous(new_labels)
+            responsibilities = new_responsibilities
+            continue
+
+        changed = float(np.mean(new_labels != labels))
+        responsibility_delta = float(
+            np.max(np.abs(new_responsibilities - responsibilities))
+        )
+        objective = assignment_objective(costs, new_labels, expert_penalty)
+        snapshot = (
+            objective,
+            new_labels.copy(),
+            # These are the weights that actually trained this tokenizer
+            # snapshot. The newly inferred responsibilities seed the next
+            # round, but must not be reported as if they trained this one.
+            responsibilities.copy(),
+            experts,
+            costs.copy(),
+            round_index + 1,
+        )
+        if best is None or objective < best[0]:
+            best = snapshot
+
         LOGGER.info(
-            "Round %d: K=%d, changed=%.2f%%, proxy objective=%.1f",
+            "Round %d: K=%d, changed=%.2f%%, responsibility delta=%.5f, "
+            "objective=%.1f",
             round_index,
-            len(np.unique(labels)),
+            len(experts),
             100 * changed,
+            responsibility_delta,
             objective,
         )
-        if (
-            changed <= args.assignment_tolerance
-            and abs(previous_objective - objective) < 1.0
-        ):
-            break
-        previous_objective = objective
 
-    final_dir = work_dir / "pre_split_merge"
-    experts = fit_experts(
-        documents,
-        labels,
-        final_dir,
-        args.vocab_size,
-        args.min_frequency,
-    )
+        stable = (
+            changed <= args.assignment_tolerance
+            and responsibility_delta
+            <= getattr(args, "responsibility_tolerance", 0.01)
+            and abs(previous_objective - objective) < 1.0
+        )
+        labels = new_labels
+        responsibilities = new_responsibilities
+        previous_objective = objective
+        if stable:
+            converged_snapshot = snapshot
+            break
+        if round_index + 1 >= max_rounds and best is not None:
+            # Finish the requested rounds unless pruning required extra fits.
+            break
+
+    chosen = converged_snapshot or best
+    if chosen is None:
+        raise RuntimeError("Tokenizer EM produced no complete expert snapshot")
+    objective, labels, responsibilities, experts, _, rounds = chosen
+    converged = converged_snapshot is not None
+    if not converged:
+        LOGGER.warning(
+            "Tokenizer EM did not reach the configured tolerances; "
+            "materializing the best complete round"
+        )
+
+    experts = materialize_experts(experts, final_dir)
     costs = token_costs(documents, experts, args.score_batch_size)
-    labels = np.argmin(costs, axis=1).astype(np.int64)
-    labels = relabel_contiguous(labels)
     objective = assignment_objective(costs, labels, expert_penalty)
-    return DiscoveryResult(labels, experts, costs, objective, expert_penalty)
+    return DiscoveryResult(
+        labels=labels,
+        experts=experts,
+        costs=costs,
+        objective=objective,
+        expert_penalty=expert_penalty,
+        responsibilities=responsibilities,
+        converged=converged,
+        em_rounds=rounds,
+    )
 
 
 def split_proposals(
     documents: Sequence[Document],
     features: Any,
+    residual_gaps: np.ndarray | None,
     result: DiscoveryResult,
     work_dir: Path,
     args: argparse.Namespace,
@@ -616,12 +994,18 @@ def split_proposals(
         mask = result.labels == expert_id
         if int(mask.sum()) < 2 * args.min_split_documents:
             continue
-        bytes_total = sum(
-            document.raw_bytes for document, keep in zip(documents, mask) if keep
-        )
-        candidates.append(
-            (float(assigned_cost[mask].sum()) / max(bytes_total, 1), int(expert_id))
-        )
+        if residual_gaps is not None and float(residual_gaps[mask].sum()) > 0:
+            # Prefer clusters responsible for the largest absolute gap to the
+            # union teacher, not merely clusters with a poor token/byte ratio.
+            priority = float(residual_gaps[mask].sum())
+        else:
+            bytes_total = sum(
+                document.raw_bytes
+                for document, keep in zip(documents, mask)
+                if keep
+            )
+            priority = float(assigned_cost[mask].sum()) / max(bytes_total, 1)
+        candidates.append((priority, int(expert_id)))
     candidates.sort(reverse=True)
 
     best: tuple[float, np.ndarray] | None = None
@@ -730,40 +1114,30 @@ def refit_result(
     args: argparse.Namespace,
     expert_penalty: float,
 ) -> DiscoveryResult:
-    experts = fit_experts(
+    return fit_experts_to_convergence(
         documents,
         labels,
+        output_dir / "em_work",
         output_dir,
-        args.vocab_size,
-        args.min_frequency,
+        args,
+        expert_penalty,
     )
-    costs = token_costs(documents, experts, args.score_batch_size)
-    labels = np.argmin(costs, axis=1).astype(np.int64)
-    labels = relabel_contiguous(labels)
-    # Refit one last time if reassignment emptied or reordered an expert.
-    if len(np.unique(labels)) != len(experts):
-        experts = fit_experts(
-            documents,
-            labels,
-            output_dir,
-            args.vocab_size,
-            args.min_frequency,
-        )
-        costs = token_costs(documents, experts, args.score_batch_size)
-        labels = np.argmin(costs, axis=1).astype(np.int64)
-    objective = assignment_objective(costs, labels, expert_penalty)
-    return DiscoveryResult(labels, experts, costs, objective, expert_penalty)
 
 
 def discover_domains(
     documents: Sequence[Document],
-    features: Any,
+    features: Any | None,
     output_dir: Path,
     args: argparse.Namespace,
 ) -> DiscoveryResult:
     initial_k = min(
         args.max_experts, max(1, len(documents) // args.min_split_documents)
     )
+    residual_gaps = None
+    if features is None or getattr(args, "initialization", "residual") == "residual":
+        features, residual_gaps = build_discovery_features(
+            documents, initial_k, output_dir, args
+        )
     labels = initialize_labels(features, initial_k, args.seed)
     expert_penalty = args.expert_penalty_tokens
     if expert_penalty is None:
@@ -787,6 +1161,7 @@ def discover_domains(
         split_labels = split_proposals(
             documents,
             features,
+            residual_gaps,
             result,
             output_dir / f"proposals_{pass_index:02d}",
             args,
@@ -874,6 +1249,11 @@ def write_reports(
     rows = np.arange(len(documents))
     assigned_costs = result.costs[rows, result.labels]
     expert_summaries = []
+    responsibilities = result.responsibilities
+    if responsibilities is None:
+        responsibilities = one_hot_responsibilities(
+            result.labels, len(result.experts)
+        )
 
     for expert_id, expert in enumerate(result.experts):
         indices = np.where(result.labels == expert_id)[0]
@@ -887,6 +1267,15 @@ def write_reports(
             {
                 "expert_id": expert_id,
                 "documents": len(indices),
+                "training_responsibility_mass": float(
+                    responsibilities[:, expert_id].sum()
+                ),
+                "overlap_documents": int(
+                    np.sum(
+                        (responsibilities[:, expert_id] > 0)
+                        & (result.labels != expert_id)
+                    )
+                ),
                 "raw_bytes": raw_bytes,
                 "tokens": token_count,
                 "bytes_per_token": raw_bytes / max(token_count, 1),
@@ -922,12 +1311,20 @@ def write_reports(
         "vocab_size_target": args.vocab_size,
         "expert_penalty_tokens": result.expert_penalty,
         "objective": result.objective,
+        "em_converged": result.converged,
+        "em_rounds": result.em_rounds,
+        "initialization": getattr(args, "initialization", "residual"),
         "elapsed_seconds": elapsed_seconds,
         "experts": expert_summaries,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
+    )
+    np.savez_compressed(
+        output_dir / "responsibilities.npz",
+        responsibilities=responsibilities.astype(np.float32),
+        hard_labels=result.labels.astype(np.int64),
     )
 
     with (output_dir / "assignments.csv").open(
@@ -1170,9 +1567,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     discovery.add_argument("--max-experts", type=int, default=8)
     discovery.add_argument("--vocab-size", type=int, default=8_192)
     discovery.add_argument("--min-frequency", type=int, default=2)
-    discovery.add_argument("--assignment-rounds", type=int, default=4)
+    discovery.add_argument("--assignment-rounds", type=int, default=12)
     discovery.add_argument("--assignment-prior-weight", type=float, default=8.0)
     discovery.add_argument("--assignment-tolerance", type=float, default=0.005)
+    discovery.add_argument("--responsibility-tolerance", type=float, default=0.01)
+    discovery.add_argument(
+        "--soft-assignment-temperature",
+        type=float,
+        default=0.02,
+        help="Relative token-regret temperature; zero restores hard EM",
+    )
+    discovery.add_argument("--soft-temperature-decay", type=float, default=0.9)
+    discovery.add_argument("--soft-top-k", type=int, default=2)
+    discovery.add_argument(
+        "--soft-training-oversample",
+        type=float,
+        default=2.0,
+        help="Weighted corpus multiplier; two lets 50/50 documents reach both experts",
+    )
     discovery.add_argument("--min-expert-fraction", type=float, default=0.01)
     discovery.add_argument("--expert-penalty-tokens", type=float, default=None)
     discovery.add_argument("--expert-penalty-fraction", type=float, default=0.005)
@@ -1180,6 +1592,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     discovery.add_argument("--split-proposals", type=int, default=2)
     discovery.add_argument("--merge-candidates", type=int, default=4)
     discovery.add_argument("--min-split-documents", type=int, default=20)
+    discovery.add_argument(
+        "--initialization", choices=["residual", "char"], default="residual"
+    )
+    discovery.add_argument(
+        "--residual-union-vocab-size",
+        type=int,
+        default=None,
+        help="Union-teacher size; defaults to initial expert count times --vocab-size",
+    )
+    discovery.add_argument(
+        "--residual-features-per-document",
+        type=int,
+        default=256,
+        help="Maximum nonzero union-merge features retained per document; zero keeps all",
+    )
     discovery.add_argument("--feature-dimensions", type=int, default=16_384)
     discovery.add_argument("--feature-ngram-max", type=int, default=5)
     discovery.add_argument("--score-batch-size", type=int, default=256)
@@ -1229,6 +1656,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         )
     if args.min_split_documents < 2:
         parser.error("--min-split-documents must be at least 2")
+    if args.assignment_rounds <= 0:
+        parser.error("--assignment-rounds must be positive")
+    if args.soft_assignment_temperature < 0:
+        parser.error("--soft-assignment-temperature must be nonnegative")
+    if not 0 < args.soft_temperature_decay <= 1:
+        parser.error("--soft-temperature-decay must be in (0, 1]")
+    if args.soft_top_k <= 0:
+        parser.error("--soft-top-k must be positive")
+    if args.soft_training_oversample < 1:
+        parser.error("--soft-training-oversample must be at least 1")
+    if args.responsibility_tolerance < 0:
+        parser.error("--responsibility-tolerance must be nonnegative")
+    if (
+        args.residual_union_vocab_size is not None
+        and args.residual_union_vocab_size < args.vocab_size
+    ):
+        parser.error("--residual-union-vocab-size must be at least --vocab-size")
+    if args.residual_features_per_document < 0:
+        parser.error("--residual-features-per-document must be nonnegative")
     return args
 
 
@@ -1263,10 +1709,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.save_sample:
         save_sample(output_dir / "sample.jsonl", documents)
 
-    LOGGER.info("Building tokenizer-independent character features")
-    features = document_features(
-        documents, args.feature_dimensions, args.feature_ngram_max
-    )
+    features = None
+    if args.initialization == "char":
+        LOGGER.info("Building tokenizer-independent character features")
+        features = document_features(
+            documents, args.feature_dimensions, args.feature_ngram_max
+        )
     result = discover_domains(documents, features, output_dir, args)
     summary = write_reports(output_dir, documents, result, args, time.time() - started)
     lm_metadata = train_shared_backbone(documents, result, output_dir, args)

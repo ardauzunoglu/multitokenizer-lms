@@ -1,0 +1,114 @@
+# Resume configuration for the single_large baseline.
+# `resume_checkpoint_path` is the checkpoint root: Nanotron reads latest.txt
+# and currently resolves it to the complete step-7500 checkpoint.
+general:
+  project: multitokenizer_lms
+  run: dclm_stack_20m_single_large_10b_seq4096_seed1000
+  seed: 1000
+  benchmark_csv_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/benchmarks/dclm_stack_20m_single_large_10b_seq4096_seed1000.csv
+  ignore_sanity_checks: true
+
+checkpoints:
+  checkpoint_interval: 500
+  checkpoints_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/checkpoints/dclm_stack_20m_single_large_10b_seq4096_seed1000
+  checkpoints_path_is_shared_file_system: false
+  resume_checkpoint_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/checkpoints/dclm_stack_20m_single_large_10b_seq4096_seed1000
+  save_initial_state: false
+  save_final_state: true
+
+tokenizer:
+  tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/tokenizers/single_large
+  tokenizer_revision: null
+  tokenizer_max_length: null
+
+data_stages:
+  - name: DCLM-Stack single_large train
+    start_training_step: 1
+    data:
+      seed: 1000
+      num_loading_workers: 8
+      dataset:
+        dataset_folder:
+          - /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/tokenized_single_large/000-source_00
+          - /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/tokenized_single_large/001-source_01
+          - /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/tokenized_single_large/002-source_02
+        dataset_weights: [5464988301, 1237438227, 3710788176]
+        tokenizer_name: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/tokenizers/single_large
+        vocab_size: 49152
+        token_size_in_bytes: 2
+        return_positions: true
+        skip_in_stream: false
+        pad_samples_to_global_batch_size: false
+        shuffle_files: true
+
+model:
+  dtype: bfloat16
+  ddp_bucket_cap_mb: 25
+  make_vocab_size_divisible_by: 1
+  init_method:
+    std: 0.02
+  model_config:
+    bos_token_id: 1
+    eos_token_id: 2
+    pad_token_id: 3
+    hidden_act: silu
+    initializer_range: 0.02
+    is_llama_config: true
+    max_position_embeddings: 4096
+    hidden_size: 256
+    intermediate_size: 896
+    num_hidden_layers: 4
+    num_attention_heads: 4
+    num_key_value_heads: 4
+    pretraining_tp: 1
+    rms_norm_eps: 1.0e-05
+    rope_scaling: null
+    tie_word_embeddings: true
+    use_cache: true
+    vocab_size: 49152
+    _attn_implementation: sdpa
+
+optimizer:
+  zero_stage: 0
+  weight_decay: 0.1
+  clip_grad: 1.0
+  accumulate_grad_in_fp32: false
+  optimizer_factory:
+    name: adamW
+    adam_eps: 1.0e-08
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    torch_adam_is_fused: true
+  learning_rate_scheduler:
+    learning_rate: 0.0006
+    lr_warmup_steps: 2000
+    lr_warmup_style: linear
+    lr_decay_steps: 9537
+    lr_decay_style: cosine
+    min_decay_lr: 0.00006
+
+parallelism:
+  dp: 2
+  pp: 1
+  tp: 1
+  expert_parallel_size: 1
+  pp_engine: 1f1b
+  tp_mode: REDUCE_SCATTER
+  tp_linear_async_communication: true
+
+tokens:
+  micro_batch_size: 16
+  batch_accumulation_per_replica: 8
+  sequence_length: 4096
+  train_steps: 9537
+  val_check_interval: -1
+  limit_val_batches: 0
+  limit_test_batches: 0
+
+logging:
+  iteration_step_info_interval: 1
+  log_level: info
+  log_level_replica: info
+
+profiler: null
+lighteval: null

@@ -1,0 +1,146 @@
+# Multi-tokenizer counterpart of
+# mlr/generated_configs/ca_llama2_12m_on_pg_10b_seq4096_seed1000.yaml.
+# The shared transformer is identical; vocabulary endpoints are one 16,384-token
+# embedding/head pair per tokenizer and are tied within each tokenizer.
+general:
+  project: multitokenizer_lms
+  run: dclm_stack_20m_10b_seq4096_seed1000
+  seed: 1000
+  benchmark_csv_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/benchmarks/dclm_stack_20m_10b_seq4096_seed1000.csv
+  ignore_sanity_checks: true
+
+checkpoints:
+  checkpoint_interval: 500
+  checkpoints_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/checkpoints/dclm_stack_20m_10b_seq4096_seed1000
+  checkpoints_path_is_shared_file_system: false
+  resume_checkpoint_path: null
+  save_initial_state: false
+  save_final_state: true
+
+multi_tokenizer:
+  batching: step_homogeneous
+  tie_word_embeddings: true
+  mask_padded_vocab_logits: true
+  schedule:
+    strategy: weighted_deficit
+    # Processed-token counts, so each routed partition is consumed in proportion
+    # to its size rather than giving every tokenizer equal weight.
+    weights: [5464988301, 1237438227, 3710788176]
+    weight_unit: tokens
+    seed: 42
+  tokenizers:
+    - id: 0
+      name: expert_00
+      tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/train_tokenizers/runs_v1/dclm-stack-50m50m/hf_tokenizers/expert_00
+      vocab_size: 16384
+    - id: 1
+      name: expert_01
+      tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/train_tokenizers/runs_v1/dclm-stack-50m50m/hf_tokenizers/expert_01
+      vocab_size: 16384
+    - id: 2
+      name: expert_02
+      tokenizer_name_or_path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/train_tokenizers/runs_v1/dclm-stack-50m50m/hf_tokenizers/expert_02
+      vocab_size: 16384
+
+data_stages:
+  - name: DCLM-Stack routed train
+    start_training_step: 1
+    data:
+      seed: 1000
+      num_loading_workers: 8
+      dataset:
+        type: multi_tokenizer_nanoset
+        return_positions: true
+        skip_in_stream: false
+        pad_samples_to_global_batch_size: false
+        shuffle_files: true
+        sources:
+          - tokenizer_id: 0
+            path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/tokenized_train/000-expert_00
+            weight: 1.0
+          - tokenizer_id: 1
+            path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/tokenized_train/001-expert_01
+            weight: 1.0
+          - tokenizer_id: 2
+            path: /scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/tokenized_train/002-expert_02
+            weight: 1.0
+
+model:
+  dtype: bfloat16
+  ddp_bucket_cap_mb: 25
+  make_vocab_size_divisible_by: 1
+  init_method:
+    std: 0.02
+  model_config:
+    bos_token_id: 1
+    eos_token_id: 2
+    pad_token_id: 3
+    hidden_act: silu
+    initializer_range: 0.02
+    is_llama_config: true
+    max_position_embeddings: 4096
+    hidden_size: 256
+    intermediate_size: 896
+    num_hidden_layers: 4
+    num_attention_heads: 4
+    num_key_value_heads: 4
+    pretraining_tp: 1
+    rms_norm_eps: 1.0e-05
+    rope_scaling: null
+    tie_word_embeddings: true
+    use_cache: true
+    # This field is ignored for the endpoint banks, which instead use the
+    # vocabulary sizes declared above.
+    vocab_size: 16384
+    # PyTorch fused scaled-dot-product attention; avoids the FlashAttention
+    # extension while it is being rebuilt for this PyTorch version.
+    _attn_implementation: sdpa
+
+optimizer:
+  zero_stage: 0
+  weight_decay: 0.1
+  clip_grad: 1.0
+  # The custom FP32-gradient DDP hook cannot reduce unused tokenizer endpoint
+  # banks in step-homogeneous multi-tokenizer batches.  Native DDP handles
+  # them correctly; the model is small enough that FP32 accumulation is not
+  # needed for memory safety.
+  accumulate_grad_in_fp32: false
+  optimizer_factory:
+    name: adamW
+    adam_eps: 1.0e-08
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    torch_adam_is_fused: true
+  learning_rate_scheduler:
+    learning_rate: 0.0006
+    lr_warmup_steps: 2000
+    lr_warmup_style: linear
+    lr_decay_steps: 9537
+    lr_decay_style: cosine
+    min_decay_lr: 0.00006
+
+parallelism:
+  dp: 2
+  pp: 1
+  tp: 1
+  expert_parallel_size: 1
+  pp_engine: 1f1b
+  tp_mode: REDUCE_SCATTER
+  tp_linear_async_communication: true
+
+tokens:
+  micro_batch_size: 32
+  batch_accumulation_per_replica: 4
+  sequence_length: 4096
+  train_steps: 9537
+  val_check_interval: -1
+  limit_val_batches: 0
+  limit_test_batches: 0
+
+logging:
+  iteration_step_info_interval: 1
+  log_level: info
+  log_level_replica: info
+
+profiler: null
+lighteval: null

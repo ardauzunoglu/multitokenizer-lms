@@ -43,6 +43,28 @@ def _tag_endpoint(module: nn.Module, tokenizer_id: int, kind: str) -> None:
         parameter.set_metadata("tokenizer_endpoint_kind", kind)
 
 
+def _inactive_endpoint_keepalive(
+    modules: nn.ModuleList, selected: int, reference: torch.Tensor
+) -> torch.Tensor:
+    """Link inactive endpoint parameters to the graph with identically zero gradients.
+
+    Step-homogeneous batches exercise one tokenizer endpoint at a time.  DDP's
+    ``find_unused_parameters`` path is not compatible with Nanotron's multiple
+    backwards per training step, so every endpoint must appear in each graph.
+    Touching one element per inactive parameter gives it a dense zero gradient
+    without changing the forward result or materializing a full parameter-sized
+    zero tensor.
+    """
+    zero = reference.new_zeros(())
+    for endpoint_id, module in enumerate(modules):
+        if endpoint_id == selected:
+            continue
+        for parameter in module.parameters():
+            if parameter.requires_grad:
+                zero = zero + parameter.reshape(-1)[0].to(dtype=reference.dtype) * 0
+    return zero
+
+
 class DisjointEmbeddingBank(nn.Module):
     def __init__(
         self,
@@ -88,7 +110,8 @@ class DisjointEmbeddingBank(nn.Module):
             raise ValueError(
                 f"Input token IDs for {vocabulary.name!r} must be in [0, {vocabulary.original_vocab_size})"
             )
-        return self.embeddings[selected](input_ids)
+        embeddings = self.embeddings[selected](input_ids)
+        return embeddings + _inactive_endpoint_keepalive(self.embeddings, selected, embeddings)
 
 
 class DisjointLMHeadBank(nn.Module):
@@ -123,6 +146,9 @@ class DisjointLMHeadBank(nn.Module):
     ) -> torch.Tensor:
         selected = checked_scalar_id(tokenizer_id, len(self.heads))
         vocabulary = self.vocabulary_config.by_id(selected)
+        # Attach inactive heads before the selected projection to avoid an extra
+        # vocab-sized operation on the logits tensor.
+        hidden_states = hidden_states + _inactive_endpoint_keepalive(self.heads, selected, hidden_states)
         logits = self.heads[selected](hidden_states)
         if (
             self.vocabulary_config.mask_padded_vocab_logits

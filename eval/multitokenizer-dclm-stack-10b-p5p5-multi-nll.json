@@ -1,0 +1,64 @@
+{
+  "block_size": {
+    "multi": 4096
+  },
+  "dataset": "ardauzunoglu/dclm-stack-10b-p5p5",
+  "device": "cuda",
+  "documents_evaluated": 4164,
+  "documents_skipped_empty_or_missing_text": 0,
+  "multi_tokenizer_lm": {
+    "bits_per_byte": 1.5728664327417026,
+    "documents": 4164,
+    "endpoints": {
+      "0": {
+        "bits_per_byte": 1.522804130814791,
+        "documents": 3740,
+        "nats_per_byte": 1.0555273898193105,
+        "nats_per_token": 4.234451117766084,
+        "nll_sum_nats": 22462412.38984251,
+        "perplexity": 69.02378240627873,
+        "predicted_tokens": 5304681,
+        "source_bytes": 21280748
+      },
+      "1": {
+        "bits_per_byte": 2.028647722648846,
+        "documents": 80,
+        "nats_per_byte": 1.4061514493034015,
+        "nats_per_token": 2.5168056206050085,
+        "nll_sum_nats": 3853795.686410904,
+        "perplexity": 12.388958354092255,
+        "predicted_tokens": 1531225,
+        "source_bytes": 2740669
+      },
+      "2": {
+        "bits_per_byte": 1.5492955182333021,
+        "documents": 344,
+        "nats_per_byte": 1.0738898203175726,
+        "nats_per_token": 2.4313978143621218,
+        "nll_sum_nats": 8373118.929016113,
+        "perplexity": 11.374770790657445,
+        "predicted_tokens": 3443747,
+        "source_bytes": 7797000
+      }
+    },
+    "model": "/weka/scratch/dkhasha1/auzunog1/multitokenizer-lms/nanotron/artifacts/hf/dclm_stack_20m_10b_seq4096_seed1000/step-9537/multi_tokenizer",
+    "nats_per_byte": 1.09022793325229,
+    "nats_per_token": 3.374562060146342,
+    "nll_sum_nats": 34689327.00526953,
+    "perplexity": 29.211488104745385,
+    "predicted_tokens": 10279653,
+    "source_bytes": 31818417
+  },
+  "routing": {
+    "documents_by_endpoint": {
+      "0": 3740,
+      "1": 80,
+      "2": 344
+    },
+    "policy": "shortest add_special_tokens=False encoding; ties use the lowest endpoint ID"
+  },
+  "source_bytes": 31818417,
+  "split": "eval",
+  "streaming": true,
+  "text_column": "text"
+}
